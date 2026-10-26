@@ -1,0 +1,6 @@
+{
+  "name": "Pixel AR Touchpad",
+  "description": "Precision DeX-inspired hardware-accelerated touchpad for Google Pixel Desktop Mode with USB-C AR glasses and a 1920x1080 Virtual AR Display Simulator.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

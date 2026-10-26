@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">Pixel AR Touchpad</string>
+    <string name="accessibility_service_label">Pixel AR Touchpad Controller</string>
+    <string name="accessibility_service_description">Write-only spatial touchpad gesture dispatcher for USB-C AR glasses (XREAL Air 2 Pro, VITURE Pro XR, Rokid Max, RayNeo Air 2s) in Google Pixel Desktop Mode. Does not read screen content or collect data.</string>
+    <string name="calibrate_button_desc">Open touchpad calibration sheet</string>
+    <string name="calibration_title">DeX Pointer &amp; Gesture Calibration</string>
+    <string name="calibration_subtitle">Tuned for 240Hz batch sampling on optical see-through AR displays</string>
+    <string name="calibration_sensitivity">Pointer Sensitivity</string>
+    <string name="calibration_scroll_speed">Two-Finger Scroll Speed</string>
+    <string name="calibration_natural_scrolling">Natural Scrolling</string>
+    <string name="calibration_natural_scrolling_desc">Content tracks finger motion during 2-finger drag across the touchpad</string>
+    <string name="calibration_tap_to_click">Tap-to-Click</string>
+    <string name="calibration_tap_to_click_desc">1-finger tap for Left Click, 3-finger tap for Right Click</string>
+    <string name="calibration_reset">Reset to DeX Defaults</string>
+    <string name="calibration_close">Done</string>
+</resources>

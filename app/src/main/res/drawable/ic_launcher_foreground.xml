@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Precision Corner L-Brackets (#38BDF8) -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M26,26h14v4h-10v10h-4zM68,26h14v14h-4v-10h-10zM26,68h4v10h10v4h-14zM78,68h4v14h-14v-4h10z" />
+    <!-- AR Glasses Visor Silhouette (#818CF8) -->
+    <path
+        android:fillColor="#818CF8"
+        android:pathData="M33,38h42c2.2,0 4,1.8 4,4v8c0,3.3 -2.7,6 -6,6h-11c-2.2,0 -4.1,-1.4 -4.8,-3.5L56,49h-4l-1.2,3.5C50.1,54.6 48.2,56 46,56H35c-3.3,0 -6,-2.7 -6,-6v-8C29,39.8 30.8,38 33,38z" />
+    <!-- Touchpad Reticle Ring & Crosshair (#38BDF8) -->
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M54,59c-6.1,0 -11,4.9 -11,11s4.9,11 11,11s11,-4.9 11,-11S60.1,59 54,59zM54,77c-3.9,0 -7,-3.1 -7,-7s3.1,-7 7,-7s7,3.1 7,7S57.9,77 54,77z" />
+    <path
+        android:fillColor="#38BDF8"
+        android:pathData="M52,66h4v8h-4zM50,68h8v4h-8z" />
+</vector>
