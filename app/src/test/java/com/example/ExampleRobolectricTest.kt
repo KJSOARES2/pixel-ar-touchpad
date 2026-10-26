@@ -6,6 +6,7 @@ import android.graphics.Canvas
 import android.os.SystemClock
 import androidx.test.core.app.ApplicationProvider
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -24,7 +25,7 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `verify DeX calibration defaults and pointer movement`() {
+    fun `verify DeX calibration defaults, prominent disclosure dialog, and pointer movement`() {
         val vm = TouchpadViewModel()
         val initial = vm.uiState.value
 
@@ -33,6 +34,11 @@ class ExampleRobolectricTest {
         assertEquals(1.2f, initial.calibration.scrollSpeed, 0.001f)
         assertTrue(initial.calibration.naturalScrolling)
         assertTrue(initial.calibration.tapToClick)
+
+        // Prominent disclosure dialog open initially when AccessibilityService is not yet connected
+        assertTrue(initial.isDisclosureDialogOpen)
+        vm.setDisclosureDialogOpen(false)
+        assertFalse(vm.uiState.value.isDisclosureDialogOpen)
 
         // 1F Move updates internal cursor coordinates without mutating UI state
         vm.onPointerMove(100f, -50f)

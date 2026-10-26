@@ -16,16 +16,16 @@ import kotlin.math.min
 /**
  * Hardware-accelerated Samsung DeX-inspired touchpad surface (`DeXCrosshairTrackpadView`).
  *
- * Performance & Rendering Architecture:
- * - Uses hardware layer acceleration (`LAYER_TYPE_HARDWARE`) and pre-cached static `Path` geometry
- *   (`centerHairlinePath`, `outerBorderPath`, `cornerBracketsPath`, `reticlePath`) rebuilt only
- *   in `onSizeChanged()`.
- * - Refactored 128-sample ring buffer (320ms decay window) renders high-velocity 240Hz trajectories
- *   using pre-allocated, hardware-accelerated `android.graphics.Path` objects (`rewind()` +
- *   quadratic Bézier midpoint smoothing `quadTo`) bucketed across 4 decay alpha bands—eliminating
- *   hundreds of per-segment `drawLine` JNI calls and ensuring C1-continuous curves at 240Hz.
- * - Tracks active pointers by stable pointer ID (`findPointerIndex`) with zero heap allocations
- *   on the `onTouchEvent` / `onDraw` hot paths.
+ * - Supports OLED Blackout Mode (`isBlackoutMode = true`): draws a 100% pure `#000000` canvas
+ *   (turning off all physical OLED pixels on Google Pixel so the phone screen is completely dark
+ *   without putting the OS or external USB-C AR display / video playback to sleep).
+ * - Gestures:
+ *   • 1-finger move: velocity-adaptive DeX dynamic pointer acceleration
+ *   • 1-finger tap (<180ms, <10dp movement): Left Click
+ *   • 1-finger double-tap & drag: Click-and-drag (for pulling down notification/quick settings shade,
+ *     dragging windows, or scrubbing video timelines)
+ *   • 2-finger tap (<210ms, <14dp movement, no scroll drag): Right Click
+ *   • 2-finger drag: Inherent vertical/horizontal scrolling across entire touchpad surface
  */
 class DeXCrosshairTrackpadView @JvmOverloads constructor(
     context: Context,
@@ -37,7 +37,8 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
         fun onPointerMove(dx: Float, dy: Float, rawVelocityPxPerMs: Float)
         fun onLeftClick()
         fun onRightClick()
-        fun onTwoFingerScroll(scrollDx: Float, scrollDy: Float)
+        fun onTwoFingerScroll(scrollDx: Float, scrollDy: Float, rawFingerDy: Float)
+        fun onOneFingerDragEnd(totalDragDx: Float, totalDragDy: Float)
     }
 
     var gestureCallback: GestureCallback? = null
@@ -48,6 +49,15 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
     var naturalScrolling: Boolean = true
     var tapToClick: Boolean = true
 
+    // True-black OLED Screen Off mode (keeps external AR display & video running)
+    var isBlackoutMode: Boolean = false
+        set(value) {
+            if (field != value) {
+                field = value
+                postInvalidateOnAnimation()
+            }
+        }
+
     private val density = resources.displayMetrics.density
     private val oneDp = 1f * density
     private val twoDp = 2f * density
@@ -56,11 +66,18 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
     private val reticleInnerRadius = 3.5f * density
     private val reticleTickLength = 7f * density
 
-    // Tap distance thresholds in pixels
+    // Tap & double-tap-drag distance thresholds in pixels
     private val oneFingerTapSlopPx = 10f * density
-    private val threeFingerTapSlopPx = 18f * density
+    private val twoFingerTapSlopPx = 14f * density
+    private val twoFingerScrollStartSlopPx = 4f * density
+    private val doubleTapSlopPx = 28f * density
 
     // Pre-allocated Paints (zero allocation in onDraw)
+    private val blackoutPaint = Paint().apply {
+        color = COLOR_PURE_OLED_OFF
+        style = Paint.Style.FILL
+    }
+
     private val surfacePaint = Paint().apply {
         color = COLOR_SURFACE_BLACK
         style = Paint.Style.FILL
@@ -141,7 +158,6 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
     private val indigoBandHasGeometry = BooleanArray(DECAY_BANDS)
     private val multiTouchTetherPath = Path()
 
-    // Pre-computed alpha and stroke widths for each decay band (0 = oldest, DECAY_BANDS-1 = newest)
     private val bandAlpha = IntArray(DECAY_BANDS) { band ->
         val fraction = (band + 1).toFloat() / DECAY_BANDS.toFloat()
         (fraction * 225f).toInt().coerceIn(28, 235)
@@ -184,11 +200,18 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
     private var downY0 = 0f
     private var downX1 = 0f
     private var downY1 = 0f
-    private var downX2 = 0f
-    private var downY2 = 0f
     private var maxMoveDistance0 = 0f
     private var maxMoveDistance1 = 0f
-    private var maxMoveDistance2 = 0f
+    private var didTwoFingerScroll = false
+
+    // Double-tap-and-drag tracking state
+    private var lastSingleTapUpTimeMs = 0L
+    private var lastSingleTapX = 0f
+    private var lastSingleTapY = 0f
+    private var isDoubleTapCandidate = false
+    private var isOneFingerDragging = false
+    private var accumulatedDragDx = 0f
+    private var accumulatedDragDy = 0f
 
     private var prevX0 = 0f
     private var prevY0 = 0f
@@ -213,14 +236,12 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
         val cx = wf * 0.5f
         val cy = hf * 0.5f
 
-        // 1. Center Hairlines Path (#0F172A)
         centerHairlinePath.rewind()
         centerHairlinePath.moveTo(0f, cy)
         centerHairlinePath.lineTo(wf, cy)
         centerHairlinePath.moveTo(cx, 0f)
         centerHairlinePath.lineTo(cx, hf)
 
-        // 2. Outer Square Border Path (1dp #1E293B)
         val halfBorder = oneDp * 0.5f
         outerBorderPath.rewind()
         outerBorderPath.addRect(
@@ -231,40 +252,30 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
             Path.Direction.CW
         )
 
-        // 3. Precision 2dp Sky-Cyan (#38BDF8) Corner L-Brackets Path
         val inset = twoDp * 0.5f
         val len = cornerBracketLength
         cornerBracketsPath.rewind()
-        // Top-Left
         cornerBracketsPath.moveTo(inset, len)
         cornerBracketsPath.lineTo(inset, inset)
         cornerBracketsPath.lineTo(len, inset)
-        // Top-Right
         cornerBracketsPath.moveTo(wf - len, inset)
         cornerBracketsPath.lineTo(wf - inset, inset)
         cornerBracketsPath.lineTo(wf - inset, len)
-        // Bottom-Left
         cornerBracketsPath.moveTo(inset, hf - len)
         cornerBracketsPath.lineTo(inset, hf - inset)
         cornerBracketsPath.lineTo(len, hf - inset)
-        // Bottom-Right
         cornerBracketsPath.moveTo(wf - len, hf - inset)
         cornerBracketsPath.lineTo(wf - inset, hf - inset)
         cornerBracketsPath.lineTo(wf - inset, hf - len)
 
-        // 4. Center Crosshair Reticle Ring & Ticks Path (#38BDF8)
         reticlePath.rewind()
         reticlePath.addCircle(cx, cy, reticleOuterRadius, Path.Direction.CW)
-        // Left tick
         reticlePath.moveTo(cx - reticleOuterRadius - reticleTickLength, cy)
         reticlePath.lineTo(cx - reticleOuterRadius + reticleTickLength * 0.5f, cy)
-        // Right tick
         reticlePath.moveTo(cx + reticleOuterRadius - reticleTickLength * 0.5f, cy)
         reticlePath.lineTo(cx + reticleOuterRadius + reticleTickLength, cy)
-        // Top tick
         reticlePath.moveTo(cx, cy - reticleOuterRadius - reticleTickLength)
         reticlePath.lineTo(cx, cy - reticleOuterRadius + reticleTickLength * 0.5f)
-        // Bottom tick
         reticlePath.moveTo(cx, cy + reticleOuterRadius - reticleTickLength * 0.5f)
         reticlePath.lineTo(cx, cy + reticleOuterRadius + reticleTickLength)
     }
@@ -279,6 +290,7 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
         y2: Float,
         timestampMs: Long
     ) {
+        if (isBlackoutMode) return
         if (!x0.isFinite() || !y0.isFinite()) return
         val idx = ringWriteIndex
         ringPointerCount[idx] = pointerCount
@@ -307,6 +319,7 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                 parent?.requestDisallowInterceptTouchEvent(true)
                 gestureStartTimeMs = event.downTime
                 maxPointersInGesture = 1
+                didTwoFingerScroll = false
 
                 pointerId0 = event.getPointerId(0)
                 pointerId1 = MotionEvent.INVALID_POINTER_ID
@@ -314,20 +327,28 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
 
                 val x0 = event.getX(0)
                 val y0 = event.getY(0)
+
+                // Check if this ACTION_DOWN is within double-tap window of a previous 1-finger tap
+                val dtSinceTap = event.downTime - lastSingleTapUpTimeMs
+                isDoubleTapCandidate = dtSinceTap in 1L..DOUBLE_TAP_WINDOW_MS &&
+                    hypot(x0 - lastSingleTapX, y0 - lastSingleTapY) < doubleTapSlopPx
+                isOneFingerDragging = false
+                accumulatedDragDx = 0f
+                accumulatedDragDy = 0f
+
                 downX0 = x0
                 downY0 = y0
                 prevX0 = x0
                 prevY0 = y0
                 maxMoveDistance0 = 0f
                 maxMoveDistance1 = 0f
-                maxMoveDistance2 = 0f
                 prevSampleTimeMs = eventTime
 
                 activePointers = 1
                 liveX0 = x0
                 liveY0 = y0
                 recordRingSample(1, x0, y0, 0f, 0f, 0f, 0f, eventTime)
-                postInvalidateOnAnimation()
+                if (!isBlackoutMode) postInvalidateOnAnimation()
                 return true
             }
 
@@ -335,6 +356,8 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                 if (pointerCount > maxPointersInGesture) {
                     maxPointersInGesture = pointerCount
                 }
+                isDoubleTapCandidate = false
+                isOneFingerDragging = false
                 syncActivePointerIds(event)
 
                 val idx0 = event.findPointerIndex(pointerId0)
@@ -350,8 +373,12 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                     val x1 = if (idx1 >= 0) event.getX(idx1) else event.getX(1)
                     val y1 = if (idx1 >= 0) event.getY(idx1) else event.getY(1)
                     if (maxMoveDistance1 == 0f) {
+                        downX0 = x0
+                        downY0 = y0
                         downX1 = x1
                         downY1 = y1
+                        maxMoveDistance0 = 0f
+                        maxMoveDistance1 = 0f
                     }
                     prevX1 = x1
                     prevY1 = y1
@@ -362,10 +389,6 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                     val idx2 = event.findPointerIndex(pointerId2)
                     val x2 = if (idx2 >= 0) event.getX(idx2) else event.getX(2)
                     val y2 = if (idx2 >= 0) event.getY(idx2) else event.getY(2)
-                    if (maxMoveDistance2 == 0f) {
-                        downX2 = x2
-                        downY2 = y2
-                    }
                     prevX2 = x2
                     prevY2 = y2
                     liveX2 = x2
@@ -374,7 +397,7 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                 activePointers = pointerCount
                 prevSampleTimeMs = eventTime
                 recordRingSample(pointerCount, liveX0, liveY0, liveX1, liveY1, liveX2, liveY2, eventTime)
-                postInvalidateOnAnimation()
+                if (!isBlackoutMode) postInvalidateOnAnimation()
                 return true
             }
 
@@ -388,7 +411,6 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                 } else -1
 
                 val historySize = event.historySize
-                // Process historical batched samples at up to 240Hz with zero heap allocations
                 for (h in 0 until historySize) {
                     val hTime = event.getHistoricalEventTime(h)
                     val hx0 = event.getHistoricalX(idx0, h)
@@ -401,7 +423,6 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                     processMoveSample(pointerCount, hx0, hy0, hx1, hy1, hx2, hy2, hTime)
                 }
 
-                // Process current sample
                 val cx0 = event.getX(idx0)
                 val cy0 = event.getY(idx0)
                 val cx1 = if (idx1 >= 0) event.getX(idx1) else 0f
@@ -410,7 +431,7 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                 val cy2 = if (idx2 >= 0) event.getY(idx2) else 0f
 
                 processMoveSample(pointerCount, cx0, cy0, cx1, cy1, cx2, cy2, eventTime)
-                postInvalidateOnAnimation()
+                if (!isBlackoutMode) postInvalidateOnAnimation()
                 return true
             }
 
@@ -451,7 +472,7 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                     slot++
                 }
                 prevSampleTimeMs = eventTime
-                postInvalidateOnAnimation()
+                if (!isBlackoutMode) postInvalidateOnAnimation()
                 return true
             }
 
@@ -462,34 +483,43 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                 pointerId2 = MotionEvent.INVALID_POINTER_ID
 
                 val durationMs = eventTime - gestureStartTimeMs
-                if (tapToClick) {
+                if (isOneFingerDragging) {
+                    isOneFingerDragging = false
+                    isDoubleTapCandidate = false
+                    gestureCallback?.onOneFingerDragEnd(accumulatedDragDx, accumulatedDragDy)
+                } else if (tapToClick) {
                     if (maxPointersInGesture == 1 &&
                         durationMs < ONE_FINGER_TAP_TIMEOUT_MS &&
                         maxMoveDistance0 < oneFingerTapSlopPx
                     ) {
+                        lastSingleTapUpTimeMs = eventTime
+                        lastSingleTapX = downX0
+                        lastSingleTapY = downY0
                         performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
                         performClick()
                         gestureCallback?.onLeftClick()
-                    } else if (maxPointersInGesture == 3 &&
-                        durationMs < THREE_FINGER_TAP_TIMEOUT_MS &&
-                        maxMoveDistance0 < threeFingerTapSlopPx &&
-                        maxMoveDistance1 < threeFingerTapSlopPx &&
-                        maxMoveDistance2 < threeFingerTapSlopPx
+                    } else if (maxPointersInGesture == 2 &&
+                        !didTwoFingerScroll &&
+                        durationMs < TWO_FINGER_TAP_TIMEOUT_MS &&
+                        maxMoveDistance0 < twoFingerTapSlopPx &&
+                        maxMoveDistance1 < twoFingerTapSlopPx
                     ) {
                         performHapticFeedback(HapticFeedbackConstants.CONTEXT_CLICK)
                         gestureCallback?.onRightClick()
                     }
                 }
-                postInvalidateOnAnimation()
+                if (!isBlackoutMode) postInvalidateOnAnimation()
                 return true
             }
 
             MotionEvent.ACTION_CANCEL -> {
                 activePointers = 0
+                isOneFingerDragging = false
+                isDoubleTapCandidate = false
                 pointerId0 = MotionEvent.INVALID_POINTER_ID
                 pointerId1 = MotionEvent.INVALID_POINTER_ID
                 pointerId2 = MotionEvent.INVALID_POINTER_ID
-                postInvalidateOnAnimation()
+                if (!isBlackoutMode) postInvalidateOnAnimation()
                 return true
             }
         }
@@ -549,7 +579,6 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
         liveY2 = y2
         activePointers = pointerCount
 
-        // Track maximum displacement from initial touch down for tap classification
         val dist0 = hypot(x0 - downX0, y0 - downY0)
         if (dist0 > maxMoveDistance0) maxMoveDistance0 = dist0
 
@@ -559,28 +588,40 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
             val stepDist = hypot(rawDx, rawDy)
             if (stepDist > 0.05f && stepDist.isFinite()) {
                 val velocityPxPerMs = stepDist / dtMs
-                // Samsung DeX-inspired dynamic velocity-adaptive pointer acceleration curve
                 val velocityBoost = (0.85f + min(velocityPxPerMs * 0.55f, 2.35f))
                 val gain = pointerSensitivity * velocityBoost
-                gestureCallback?.onPointerMove(rawDx * gain, rawDy * gain, velocityPxPerMs)
+                val scaledDx = rawDx * gain
+                val scaledDy = rawDy * gain
+
+                if (isDoubleTapCandidate && !isOneFingerDragging && maxMoveDistance0 > oneFingerTapSlopPx) {
+                    isOneFingerDragging = true
+                    performHapticFeedback(HapticFeedbackConstants.LONG_PRESS)
+                }
+
+                if (isOneFingerDragging) {
+                    accumulatedDragDx += scaledDx * 1.45f
+                    accumulatedDragDy += scaledDy * 1.45f
+                }
+
+                gestureCallback?.onPointerMove(scaledDx, scaledDy, velocityPxPerMs)
             }
         } else if (pointerCount == 2 && maxPointersInGesture == 2) {
             val dist1 = hypot(x1 - downX1, y1 - downY1)
             if (dist1 > maxMoveDistance1) maxMoveDistance1 = dist1
 
-            val avgDx = ((x0 - prevX0) + (x1 - prevX1)) * 0.5f
-            val avgDy = ((y0 - prevY0) + (y1 - prevY1)) * 0.5f
-            if ((abs(avgDx) > 0.1f || abs(avgDy) > 0.1f) && avgDx.isFinite() && avgDy.isFinite()) {
-                val directionSign = if (naturalScrolling) 1f else -1f
-                val scaledDx = avgDx * scrollSpeed * directionSign
-                val scaledDy = avgDy * scrollSpeed * directionSign
-                gestureCallback?.onTwoFingerScroll(scaledDx, scaledDy)
+            if (didTwoFingerScroll || maxMoveDistance0 > twoFingerScrollStartSlopPx || maxMoveDistance1 > twoFingerScrollStartSlopPx) {
+                val avgDx = ((x0 - prevX0) + (x1 - prevX1)) * 0.5f
+                val avgDy = ((y0 - prevY0) + (y1 - prevY1)) * 0.5f
+                if ((abs(avgDx) > 0.1f || abs(avgDy) > 0.1f) && avgDx.isFinite() && avgDy.isFinite()) {
+                    if (maxMoveDistance0 >= twoFingerTapSlopPx || maxMoveDistance1 >= twoFingerTapSlopPx) {
+                        didTwoFingerScroll = true
+                    }
+                    val directionSign = if (naturalScrolling) 1f else -1f
+                    val scaledDx = avgDx * scrollSpeed * directionSign
+                    val scaledDy = avgDy * scrollSpeed * directionSign
+                    gestureCallback?.onTwoFingerScroll(scaledDx, scaledDy, avgDy)
+                }
             }
-        } else if (pointerCount >= 3) {
-            val dist1 = hypot(x1 - downX1, y1 - downY1)
-            if (dist1 > maxMoveDistance1) maxMoveDistance1 = dist1
-            val dist2 = hypot(x2 - downX2, y2 - downY2)
-            if (dist2 > maxMoveDistance2) maxMoveDistance2 = dist2
         }
 
         prevX0 = x0
@@ -598,6 +639,13 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
         val w = width.toFloat()
         val h = height.toFloat()
         if (w <= 0f || h <= 0f) return
+
+        // In OLED Blackout Mode, draw 100% pure #000000 (all physical OLED subpixels off)
+        // and skip all HUD/trail drawing so the phone screen emits zero light.
+        if (isBlackoutMode) {
+            canvas.drawRect(0f, 0f, w, h, blackoutPaint)
+            return
+        }
 
         // 1. Deep AMOLED Slate-Black Surface (#08090C)
         canvas.drawRect(0f, 0f, w, h, surfacePaint)
@@ -629,22 +677,15 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
             }
         }
 
-        // Schedule next 240Hz/120Hz animation frame ONLY while trails are actively decaying
         val newestAgeMs = (nowMs - newestSampleTimeMs).coerceAtLeast(0L)
         if (hasActiveDecay || activePointers > 0 || (ringCount > 0 && newestAgeMs < DECAY_WINDOW_MS)) {
             postInvalidateOnAnimation()
         } else if (ringCount > 0) {
-            // All samples have completely decayed — reset ring count so idle frames are O(1)
             ringCount = 0
             ringWriteIndex = 0
         }
     }
 
-    /**
-     * Builds smooth quadratic Bézier `Path` curves across `DECAY_BANDS` opacity bands from the
-     * 128-sample ring buffer using `Path.rewind()` (retaining native Skia vertex buffers without
-     * heap or native allocations) and renders them via hardware-accelerated `canvas.drawPath()`.
-     */
     internal fun buildAndDrawHardwareTrailPaths(canvas: Canvas, nowMs: Long): Boolean {
         if (ringCount <= 1) return false
 
@@ -667,7 +708,6 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
 
         for (step in 1 until ringCount) {
             val currIdx = (oldestIndex + step) and RING_MASK
-            // Clamp negative delta caused by 1-2ms input resampling lead so newest sample never drops
             val ageMs = (nowMs - ringTimeMs[currIdx]).coerceAtLeast(0L)
 
             val pCount = ringPointerCount[currIdx]
@@ -700,13 +740,11 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
                 val lifeFraction = 1f - (ageMs.toFloat() / DECAY_WINDOW_MS.toFloat())
                 val band = ((lifeFraction * DECAY_BANDS).toInt()).coerceIn(0, DECAY_BANDS - 1)
 
-                // Primary finger quadratic Bézier curve (Sky-Cyan #38BDF8)
                 val cPath = cyanDecayPaths[band]
                 cPath.moveTo(prevMidX0, prevMidY0)
                 cPath.quadTo(px0, py0, midX0, midY0)
                 cyanBandHasGeometry[band] = true
 
-                // Multi-touch finger 2 & 3 quadratic Bézier curves (Electric Indigo #818CF8)
                 if (pCount >= 2) {
                     val iPath = indigoDecayPaths[band]
                     iPath.moveTo(prevMidX1, prevMidY1)
@@ -769,8 +807,10 @@ class DeXCrosshairTrackpadView @JvmOverloads constructor(
         private const val DECAY_BANDS = 4
 
         private const val ONE_FINGER_TAP_TIMEOUT_MS = 180L
-        private const val THREE_FINGER_TAP_TIMEOUT_MS = 240L
+        private const val TWO_FINGER_TAP_TIMEOUT_MS = 210L
+        private const val DOUBLE_TAP_WINDOW_MS = 280L
 
+        private const val COLOR_PURE_OLED_OFF = 0xFF000000.toInt()
         private const val COLOR_SURFACE_BLACK = 0xFF08090C.toInt()
         private const val COLOR_CENTER_HAIRLINE = 0xFF0F172A.toInt()
         private const val COLOR_OUTER_BORDER = 0xFF1E293B.toInt()

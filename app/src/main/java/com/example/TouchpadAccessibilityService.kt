@@ -6,17 +6,20 @@ import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
 import android.graphics.Path
+import android.graphics.PixelFormat
 import android.hardware.display.DisplayManager
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.DisplayMetrics
 import android.view.Display
+import android.view.Gravity
+import android.view.WindowManager
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.math.max
-import kotlin.math.min
+import kotlin.math.hypot
 
 data class ExternalArDisplayInfo(
     val displayId: Int,
@@ -27,16 +30,14 @@ data class ExternalArDisplayInfo(
 )
 
 /**
- * Write-only AccessibilityService + DisplayManager.DisplayListener.
+ * Write-only AccessibilityService + DisplayManager.DisplayListener + External AR Cursor Overlay.
  *
- * Security & Performance Design:
- * - Strictly write-only (`canRetrieveWindowContent="false"`, `accessibilityEventTypes=""`, `exported="false"`).
- * - Detects USB-C DisplayPort Alt-Mode AR glasses presentation displays
- *   (`Display.FLAG_PRESENTATION` or `displayId != Display.DEFAULT_DISPLAY`).
- * - Automatically launches `MainActivity` on `Display.DEFAULT_DISPLAY` (0) when AR glasses connect.
- * - Reuses a single pre-allocated `android.graphics.Path` (`reusablePath.rewind()` / `reset()`)
- *   and guards concurrent gesture dispatches via an `AtomicBoolean` gate to prevent binder queue
- *   saturation during 240Hz high-velocity gestures.
+ * Supports:
+ * - Real-time pass-through DeX mouse cursor overlay (`TYPE_ACCESSIBILITY_OVERLAY`) on the external AR display.
+ * - Top status bar Notification & Quick Settings pull-down when clicking or pulling down near the top edge
+ *   of the AR desktop (`externalCursorY <= 48f`).
+ * - 1-finger double-tap-and-drag strokes (`dispatchExternalDrag`).
+ * - 2-finger scroll accumulation past `touchSlop`.
  */
 class TouchpadAccessibilityService : AccessibilityService(), DisplayManager.DisplayListener {
 
@@ -47,20 +48,31 @@ class TouchpadAccessibilityService : AccessibilityService(), DisplayManager.Disp
     private val reusablePath = Path()
     private val isGestureInFlight = AtomicBoolean(false)
 
+    // External AR display overlay state
+    private var overlayWindowManager: WindowManager? = null
+    private var overlayView: ArExternalCursorOverlayView? = null
+    private var overlayDisplayId: Int = Display.INVALID_DISPLAY
+
+    // Live cursor coordinates on the external AR display
+    private var externalCursorX: Float = 960f
+    private var externalCursorY: Float = 540f
+    private var externalWidth: Float = 1920f
+    private var externalHeight: Float = 1080f
+
+    // Scroll accumulator so micro 240Hz deltas combine into strokes that exceed Android touchSlop
+    private var pendingScrollDx: Float = 0f
+    private var pendingScrollDy: Float = 0f
+
     private val gestureResultCallback = object : GestureResultCallback() {
         override fun onCompleted(gestureDescription: GestureDescription?) {
             isGestureInFlight.set(false)
+            flushPendingScrollIfNeeded()
         }
 
         override fun onCancelled(gestureDescription: GestureDescription?) {
             isGestureInFlight.set(false)
         }
     }
-
-    private var externalCursorX: Float = 960f
-    private var externalCursorY: Float = 540f
-    private var externalWidth: Float = 1920f
-    private var externalHeight: Float = 1080f
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -81,6 +93,7 @@ class TouchpadAccessibilityService : AccessibilityService(), DisplayManager.Disp
     }
 
     override fun onUnbind(intent: Intent?): Boolean {
+        removeExternalCursorOverlay()
         if (::displayManager.isInitialized) {
             runCatching { displayManager.unregisterDisplayListener(this) }
         }
@@ -91,6 +104,7 @@ class TouchpadAccessibilityService : AccessibilityService(), DisplayManager.Disp
     }
 
     override fun onDestroy() {
+        removeExternalCursorOverlay()
         if (::displayManager.isInitialized) {
             runCatching { displayManager.unregisterDisplayListener(this) }
         }
@@ -108,6 +122,9 @@ class TouchpadAccessibilityService : AccessibilityService(), DisplayManager.Disp
     }
 
     override fun onDisplayRemoved(displayId: Int) {
+        if (displayId == overlayDisplayId) {
+            removeExternalCursorOverlay()
+        }
         refreshExternalDisplays(autoLaunchIfFound = false)
     }
 
@@ -117,78 +134,234 @@ class TouchpadAccessibilityService : AccessibilityService(), DisplayManager.Disp
 
     private fun refreshExternalDisplays(autoLaunchIfFound: Boolean): ExternalArDisplayInfo? {
         if (!::displayManager.isInitialized) return null
-        val found = findExternalArDisplay(displayManager)
+        val displayObj = findExternalDisplayObject(displayManager)
+        val found = displayObj?.let { extractDisplayInfo(this, it) }
         _activeArDisplay.value = found
-        if (found != null) {
+
+        if (found != null && displayObj != null) {
             externalWidth = found.width.toFloat().coerceAtLeast(100f)
             externalHeight = found.height.toFloat().coerceAtLeast(100f)
             externalCursorX = externalCursorX.coerceIn(1f, externalWidth - 1f)
             externalCursorY = externalCursorY.coerceIn(1f, externalHeight - 1f)
+
+            attachOrUpdateExternalCursorOverlay(displayObj)
+
             if (autoLaunchIfFound) {
                 launchTouchpadOnDefaultDisplay(this)
             }
+        } else {
+            removeExternalCursorOverlay()
         }
         return found
     }
 
-    /**
-     * Dispatches a pointer tap (Left Click) on the external AR display using reusablePath.reset().
-     */
-    fun dispatchExternalTap(normalizedX: Float, normalizedY: Float) {
-        val targetDisplay = _activeArDisplay.value ?: return
-        if (!normalizedX.isFinite() || !normalizedY.isFinite()) return
+    private fun attachOrUpdateExternalCursorOverlay(targetDisplay: Display) {
+        if (overlayView != null && overlayDisplayId == targetDisplay.displayId) {
+            overlayView?.updateCursorPosition(externalCursorX, externalCursorY)
+            return
+        }
+        removeExternalCursorOverlay()
 
-        val x = (normalizedX * externalWidth).coerceIn(1f, externalWidth - 1f)
-        val y = (normalizedY * externalHeight).coerceIn(1f, externalHeight - 1f)
-        externalCursorX = x
-        externalCursorY = y
+        runCatching {
+            val displayContext = createDisplayContext(targetDisplay)
+            val wm = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                runCatching {
+                    val windowCtx = displayContext.createWindowContext(
+                        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                        null
+                    )
+                    windowCtx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                }.getOrElse {
+                    displayContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+                }
+            } else {
+                displayContext.getSystemService(Context.WINDOW_SERVICE) as WindowManager
+            }
 
-        reusablePath.reset()
-        reusablePath.moveTo(x, y)
+            val view = ArExternalCursorOverlayView(displayContext).apply {
+                updateCursorPosition(externalCursorX, externalCursorY)
+            }
 
-        val stroke = GestureDescription.StrokeDescription(reusablePath, 0L, 24L)
-        dispatchStrokeToDisplay(stroke, targetDisplay.displayId, forceReplace = true)
+            val lp = WindowManager.LayoutParams(
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.MATCH_PARENT,
+                WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+                WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                    WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                    WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
+                    WindowManager.LayoutParams.FLAG_HARDWARE_ACCELERATED,
+                PixelFormat.TRANSLUCENT
+            ).apply {
+                gravity = Gravity.TOP or Gravity.START
+            }
+
+            wm.addView(view, lp)
+            overlayWindowManager = wm
+            overlayView = view
+            overlayDisplayId = targetDisplay.displayId
+        }
+    }
+
+    private fun removeExternalCursorOverlay() {
+        val wm = overlayWindowManager
+        val view = overlayView
+        overlayWindowManager = null
+        overlayView = null
+        overlayDisplayId = Display.INVALID_DISPLAY
+        if (wm != null && view != null) {
+            runCatching { wm.removeViewImmediate(view) }
+        }
     }
 
     /**
-     * Dispatches a Right Click (3-finger tap) on the external AR display using reusablePath.reset().
+     * Moves the live cursor on the external AR glasses display in real time during 240Hz 1-finger moves.
      */
-    fun dispatchExternalRightClick(normalizedX: Float, normalizedY: Float) {
-        val targetDisplay = _activeArDisplay.value ?: return
-        if (!normalizedX.isFinite() || !normalizedY.isFinite()) return
+    fun moveExternalCursorByDelta(dx: Float, dy: Float): Pair<Float, Float> {
+        if (!dx.isFinite() || !dy.isFinite()) return externalCursorX to externalCursorY
+        val viewW = overlayView?.width?.toFloat() ?: 0f
+        val viewH = overlayView?.height?.toFloat() ?: 0f
+        if (viewW > 100f && viewH > 100f) {
+            externalWidth = viewW
+            externalHeight = viewH
+        }
 
-        val x = (normalizedX * externalWidth).coerceIn(1f, externalWidth - 1f)
-        val y = (normalizedY * externalHeight).coerceIn(1f, externalHeight - 1f)
-        externalCursorX = x
-        externalCursorY = y
-
-        reusablePath.reset()
-        reusablePath.moveTo(x, y)
-
-        val stroke = GestureDescription.StrokeDescription(reusablePath, 0L, 420L)
-        dispatchStrokeToDisplay(stroke, targetDisplay.displayId, forceReplace = true)
+        externalCursorX = (externalCursorX + dx * 1.45f).coerceIn(0f, externalWidth - 1f)
+        externalCursorY = (externalCursorY + dy * 1.45f).coerceIn(0f, externalHeight - 1f)
+        overlayView?.updateCursorPosition(externalCursorX, externalCursorY)
+        return externalCursorX to externalCursorY
     }
 
     /**
-     * Dispatches a two-finger scroll stroke at the current external AR cursor position using reusablePath.reset().
+     * Dispatches a pointer tap (Left Click) at the current external AR cursor position.
      */
-    fun dispatchExternalScroll(normalizedX: Float, normalizedY: Float, scrollDx: Float, scrollDy: Float) {
-        val targetDisplay = _activeArDisplay.value ?: return
-        if (!normalizedX.isFinite() || !normalizedY.isFinite() || !scrollDx.isFinite() || !scrollDy.isFinite()) return
-        if (isGestureInFlight.get()) return
+    fun dispatchExternalTap() {
+        val targetDisplayId = resolveTargetDisplayId()
+        val x = externalCursorX.coerceIn(1f, externalWidth - 2f)
+        val y = externalCursorY.coerceIn(1f, externalHeight - 2f)
 
-        val startX = (normalizedX * externalWidth).coerceIn(40f, externalWidth - 40f)
-        val startY = (normalizedY * externalHeight).coerceIn(40f, externalHeight - 40f)
-        val endX = (startX + scrollDx).coerceIn(10f, externalWidth - 10f)
-        val endY = (startY + scrollDy).coerceIn(10f, externalHeight - 10f)
-        if (startX == endX && startY == endY) return
+        overlayView?.triggerClickPulse(rightClick = false)
+
+        reusablePath.reset()
+        reusablePath.moveTo(x, y)
+        reusablePath.lineTo(x + 0.5f, y + 0.5f)
+
+        val stroke = GestureDescription.StrokeDescription(reusablePath, 0L, 45L)
+        dispatchStrokeToDisplay(stroke, targetDisplayId, forceReplace = true)
+    }
+
+    /**
+     * Dispatches a Right Click (2-finger tap -> context click / long press) at the current external AR cursor position.
+     */
+    fun dispatchExternalRightClick() {
+        val targetDisplayId = resolveTargetDisplayId()
+        val x = externalCursorX.coerceIn(1f, externalWidth - 2f)
+        val y = externalCursorY.coerceIn(1f, externalHeight - 2f)
+
+        overlayView?.triggerClickPulse(rightClick = true)
+
+        reusablePath.reset()
+        reusablePath.moveTo(x, y)
+        reusablePath.lineTo(x + 0.5f, y + 0.5f)
+
+        val stroke = GestureDescription.StrokeDescription(reusablePath, 0L, 500L)
+        dispatchStrokeToDisplay(stroke, targetDisplayId, forceReplace = true)
+    }
+
+    /**
+     * Dispatches a 1-finger double-tap-and-drag stroke (or top-edge notification/quick-settings pull-down).
+     */
+    fun dispatchExternalDrag(totalDragDx: Float, totalDragDy: Float) {
+        val targetDisplayId = resolveTargetDisplayId()
+        val endX = externalCursorX.coerceIn(2f, externalWidth - 2f)
+        val endY = externalCursorY.coerceIn(2f, externalHeight - 2f)
+        val startX = (endX - totalDragDx).coerceIn(2f, externalWidth - 2f)
+        val startY = (endY - totalDragDy).coerceIn(0f, externalHeight - 2f)
+
+        // If user dragged downward starting from the top status bar area (startY <= 56f),
+        // pull down the desktop Notification / Quick Settings shade
+        if (startY <= 56f && totalDragDy > 40f) {
+            dispatchTopBarShadePullDown(startX, targetDisplayId)
+            return
+        }
+
+        if (hypot(endX - startX, endY - startY) < 8f) return
 
         reusablePath.reset()
         reusablePath.moveTo(startX, startY)
         reusablePath.lineTo(endX, endY)
 
-        val stroke = GestureDescription.StrokeDescription(reusablePath, 0L, 48L)
-        dispatchStrokeToDisplay(stroke, targetDisplay.displayId, forceReplace = false)
+        val stroke = GestureDescription.StrokeDescription(reusablePath, 0L, 160L)
+        dispatchStrokeToDisplay(stroke, targetDisplayId, forceReplace = true)
+    }
+
+    /**
+     * Pulls down the desktop Notification / Quick Settings shade when triggered at the top edge.
+     */
+    private fun dispatchTopBarShadePullDown(xCoord: Float, targetDisplayId: Int) {
+        val x = xCoord.coerceIn(20f, externalWidth - 20f)
+        reusablePath.reset()
+        reusablePath.moveTo(x, 1f)
+        reusablePath.lineTo(x, (externalHeight * 0.62f).coerceAtLeast(300f))
+
+        val stroke = GestureDescription.StrokeDescription(reusablePath, 0L, 180L)
+        dispatchStrokeToDisplay(stroke, targetDisplayId, forceReplace = true)
+    }
+
+    /**
+     * Accumulates 240Hz two-finger scroll deltas and dispatches a swipe stroke that exceeds Android's touchSlop.
+     * Also detects 2-finger downward pull when the cursor is parked on the top status bar to open
+     * Notifications / Quick Settings easily.
+     */
+    fun dispatchExternalScroll(scrollDx: Float, scrollDy: Float, rawFingerDy: Float) {
+        if (!scrollDx.isFinite() || !scrollDy.isFinite()) return
+        overlayView?.notifyActivity()
+
+        // If cursor is in the top status bar (top 48px) and fingers pull downward, pull down Notification/Quick Settings shade
+        if (externalCursorY <= 48f && rawFingerDy > 6f && !isGestureInFlight.get()) {
+            pendingScrollDx = 0f
+            pendingScrollDy = 0f
+            dispatchTopBarShadePullDown(externalCursorX, resolveTargetDisplayId())
+            return
+        }
+
+        pendingScrollDx = (pendingScrollDx + scrollDx * 2.2f).coerceIn(-420f, 420f)
+        pendingScrollDy = (pendingScrollDy + scrollDy * 2.2f).coerceIn(-420f, 420f)
+        flushPendingScrollIfNeeded()
+    }
+
+    private fun flushPendingScrollIfNeeded() {
+        if (isGestureInFlight.get()) return
+        val mag = hypot(pendingScrollDx, pendingScrollDy)
+        if (mag < 18f) return
+
+        val scale = if (mag < 96f) 96f / mag else 1f
+        val strokeDx = (pendingScrollDx * scale).coerceIn(-360f, 360f)
+        val strokeDy = (pendingScrollDy * scale).coerceIn(-360f, 360f)
+        pendingScrollDx = 0f
+        pendingScrollDy = 0f
+
+        val targetDisplayId = resolveTargetDisplayId()
+        val margin = 48f
+        val startX = externalCursorX.coerceIn(margin, (externalWidth - margin).coerceAtLeast(margin + 1f))
+        val startY = externalCursorY.coerceIn(margin, (externalHeight - margin).coerceAtLeast(margin + 1f))
+        val endX = (startX + strokeDx).coerceIn(4f, externalWidth - 4f)
+        val endY = (startY + strokeDy).coerceIn(4f, externalHeight - 4f)
+        if (hypot(endX - startX, endY - startY) < 12f) return
+
+        reusablePath.reset()
+        reusablePath.moveTo(startX, startY)
+        reusablePath.lineTo(endX, endY)
+
+        val stroke = GestureDescription.StrokeDescription(reusablePath, 0L, 85L)
+        dispatchStrokeToDisplay(stroke, targetDisplayId, forceReplace = false)
+    }
+
+    private fun resolveTargetDisplayId(): Int {
+        val active = _activeArDisplay.value
+        if (active != null) return active.displayId
+        val refreshed = refreshExternalDisplays(autoLaunchIfFound = false)
+        return refreshed?.displayId ?: Display.DEFAULT_DISPLAY
     }
 
     private fun dispatchStrokeToDisplay(
@@ -202,7 +375,7 @@ class TouchpadAccessibilityService : AccessibilityService(), DisplayManager.Disp
         isGestureInFlight.set(true)
         runCatching {
             val builder = GestureDescription.Builder().addStroke(stroke)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && displayId != Display.DEFAULT_DISPLAY) {
                 builder.setDisplayId(displayId)
             }
             val dispatched = dispatchGesture(builder.build(), gestureResultCallback, mainHandler)
@@ -226,34 +399,57 @@ class TouchpadAccessibilityService : AccessibilityService(), DisplayManager.Disp
         val activeArDisplay: StateFlow<ExternalArDisplayInfo?> = _activeArDisplay.asStateFlow()
 
         fun syncDisplaysFromContext(context: Context): ExternalArDisplayInfo? {
+            val svc = instance
+            if (svc != null) {
+                return svc.refreshExternalDisplays(autoLaunchIfFound = false)
+            }
             val dm = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
-            val found = findExternalArDisplay(dm)
+            val displayObj = findExternalDisplayObject(dm)
+            val found = displayObj?.let { extractDisplayInfo(context, it) }
             _activeArDisplay.value = found
             return found
         }
 
-        @Suppress("DEPRECATION")
-        fun findExternalArDisplay(displayManager: DisplayManager): ExternalArDisplayInfo? {
-            val displays = displayManager.displays ?: return null
-            var candidate: Display? = null
-            for (i in displays.indices) {
-                val d = displays[i] ?: continue
-                val isPresentation = (d.flags and Display.FLAG_PRESENTATION) != 0
-                if (isPresentation || d.displayId != Display.DEFAULT_DISPLAY) {
-                    candidate = d
-                    if (isPresentation) break
-                }
+        private fun findExternalDisplayObject(displayManager: DisplayManager): Display? {
+            val allDisplays = LinkedHashMap<Int, Display>()
+            displayManager.displays?.forEach { d ->
+                if (d != null) allDisplays[d.displayId] = d
             }
-            val display = candidate ?: return null
+            displayManager.getDisplays(DisplayManager.DISPLAY_CATEGORY_PRESENTATION)?.forEach { d ->
+                if (d != null) allDisplays[d.displayId] = d
+            }
+
+            var candidate: Display? = null
+            for (d in allDisplays.values) {
+                if (d.displayId == Display.DEFAULT_DISPLAY) continue
+                val isPresentation = (d.flags and Display.FLAG_PRESENTATION) != 0
+                candidate = d
+                if (isPresentation) break
+            }
+            return candidate
+        }
+
+        @Suppress("DEPRECATION")
+        private fun extractDisplayInfo(context: Context, display: Display): ExternalArDisplayInfo {
+            val metrics = DisplayMetrics()
+            runCatching {
+                context.createDisplayContext(display).resources.displayMetrics.let { dm ->
+                    metrics.setTo(dm)
+                }
+            }.onFailure {
+                display.getRealMetrics(metrics)
+            }
+
             val mode = display.mode
-            val width = max(mode?.physicalWidth ?: 1920, mode?.physicalHeight ?: 1080)
-            val height = min(mode?.physicalWidth ?: 1920, mode?.physicalHeight ?: 1080)
+            val w = if (metrics.widthPixels > 0) metrics.widthPixels else (mode?.physicalWidth ?: 1920)
+            val h = if (metrics.heightPixels > 0) metrics.heightPixels else (mode?.physicalHeight ?: 1080)
             val refresh = mode?.refreshRate?.toInt() ?: 60
+
             return ExternalArDisplayInfo(
                 displayId = display.displayId,
                 name = display.name ?: "USB-C AR Glasses",
-                width = width,
-                height = height,
+                width = w,
+                height = h,
                 refreshRate = refresh
             )
         }

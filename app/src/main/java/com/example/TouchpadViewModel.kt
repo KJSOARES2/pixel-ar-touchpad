@@ -16,6 +16,8 @@ data class CalibrationConfig(
 
 data class TouchpadUiState(
     val isCalibrationSheetOpen: Boolean = false,
+    val isDisclosureDialogOpen: Boolean = !TouchpadAccessibilityService.isServiceConnected.value,
+    val isBlackoutMode: Boolean = false,
     val calibration: CalibrationConfig = CalibrationConfig()
 )
 
@@ -24,7 +26,6 @@ class TouchpadViewModel : ViewModel() {
     private val _uiState = MutableStateFlow(TouchpadUiState())
     val uiState: StateFlow<TouchpadUiState> = _uiState.asStateFlow()
 
-    // Internal cursor coordinates for external AR display dispatch (no UI state recomposition on move)
     var cursorX: Float = 960f
         private set
     var cursorY: Float = 540f
@@ -32,6 +33,14 @@ class TouchpadViewModel : ViewModel() {
 
     fun setCalibrationSheetOpen(open: Boolean) {
         _uiState.update { it.copy(isCalibrationSheetOpen = open) }
+    }
+
+    fun setDisclosureDialogOpen(open: Boolean) {
+        _uiState.update { it.copy(isDisclosureDialogOpen = open) }
+    }
+
+    fun setBlackoutMode(enabled: Boolean) {
+        _uiState.update { it.copy(isBlackoutMode = enabled) }
     }
 
     fun updateSensitivity(value: Float) {
@@ -74,26 +83,31 @@ class TouchpadViewModel : ViewModel() {
     }
 
     fun onPointerMove(dx: Float, dy: Float) {
-        cursorX = (cursorX + dx * 1.45f).coerceIn(0f, AR_VIEWPORT_WIDTH)
-        cursorY = (cursorY + dy * 1.45f).coerceIn(0f, AR_VIEWPORT_HEIGHT)
+        val svc = TouchpadAccessibilityService.instance
+        if (svc != null) {
+            val (extX, extY) = svc.moveExternalCursorByDelta(dx, dy)
+            cursorX = extX
+            cursorY = extY
+        } else {
+            cursorX = (cursorX + dx * 1.45f).coerceIn(0f, AR_VIEWPORT_WIDTH)
+            cursorY = (cursorY + dy * 1.45f).coerceIn(0f, AR_VIEWPORT_HEIGHT)
+        }
     }
 
     fun onLeftClick() {
-        val normX = (cursorX / AR_VIEWPORT_WIDTH).coerceIn(0f, 1f)
-        val normY = (cursorY / AR_VIEWPORT_HEIGHT).coerceIn(0f, 1f)
-        TouchpadAccessibilityService.instance?.dispatchExternalTap(normX, normY)
+        TouchpadAccessibilityService.instance?.dispatchExternalTap()
     }
 
     fun onRightClick() {
-        val normX = (cursorX / AR_VIEWPORT_WIDTH).coerceIn(0f, 1f)
-        val normY = (cursorY / AR_VIEWPORT_HEIGHT).coerceIn(0f, 1f)
-        TouchpadAccessibilityService.instance?.dispatchExternalRightClick(normX, normY)
+        TouchpadAccessibilityService.instance?.dispatchExternalRightClick()
     }
 
-    fun onTwoFingerScroll(scrollDx: Float, scrollDy: Float) {
-        val normX = (cursorX / AR_VIEWPORT_WIDTH).coerceIn(0f, 1f)
-        val normY = (cursorY / AR_VIEWPORT_HEIGHT).coerceIn(0f, 1f)
-        TouchpadAccessibilityService.instance?.dispatchExternalScroll(normX, normY, scrollDx, scrollDy)
+    fun onTwoFingerScroll(scrollDx: Float, scrollDy: Float, rawFingerDy: Float) {
+        TouchpadAccessibilityService.instance?.dispatchExternalScroll(scrollDx, scrollDy, rawFingerDy)
+    }
+
+    fun onOneFingerDragEnd(totalDragDx: Float, totalDragDy: Float) {
+        TouchpadAccessibilityService.instance?.dispatchExternalDrag(totalDragDx, totalDragDy)
     }
 
     companion object {

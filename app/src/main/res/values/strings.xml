@@ -10,7 +10,23 @@
     <string name="calibration_natural_scrolling">Natural Scrolling</string>
     <string name="calibration_natural_scrolling_desc">Content tracks finger motion during 2-finger drag across the touchpad</string>
     <string name="calibration_tap_to_click">Tap-to-Click</string>
-    <string name="calibration_tap_to_click_desc">1-finger tap for Left Click, 3-finger tap for Right Click</string>
+    <string name="calibration_tap_to_click_desc">1-finger tap for Left Click, 2-finger tap for Right Click</string>
+    <string name="calibration_a11y_section_title">External AR Display Gesture Dispatch</string>
+    <string name="calibration_a11y_active">Write-Only Service Active</string>
+    <string name="calibration_a11y_inactive">Service Inactive • Tap to Review &amp; Enable</string>
+    <string name="calibration_a11y_review_btn">Disclosure</string>
     <string name="calibration_reset">Reset to DeX Defaults</string>
     <string name="calibration_close">Done</string>
+
+    <!-- Google Play Policy Prominent Disclosure Strings -->
+    <string name="disclosure_title">Accessibility Service Disclosure</string>
+    <string name="disclosure_intro">Pixel AR Touchpad uses the Android AccessibilityService API to operate as an eyes-free touchpad when USB-C AR glasses are connected.</string>
+    <string name="disclosure_point_1_title">1. External AR Display Gesture Dispatch</string>
+    <string name="disclosure_point_1_body">Used exclusively to dispatch 1-finger Left Clicks, 2-finger Right Clicks, and 2-finger Scroll gestures onto external USB-C DisplayPort Alt-Mode AR displays and auto-launch the touchpad when glasses connect.</string>
+    <string name="disclosure_point_2_title">2. Strictly Write-Only (No Screen Reading)</string>
+    <string name="disclosure_point_2_body">Configured with canRetrieveWindowContent=\"false\" and empty accessibilityEventTypes. The app cannot read screen text, UI hierarchies, passwords, or keystrokes.</string>
+    <string name="disclosure_point_3_title">3. Zero Permissions &amp; Zero Data Collection</string>
+    <string name="disclosure_point_3_body">This app declares zero manifest permissions (no Internet access) and never collects, stores, or transmits any personal or sensitive user data.</string>
+    <string name="disclosure_accept">Accept &amp; Open Settings</string>
+    <string name="disclosure_decline">Not Now</string>
 </resources>

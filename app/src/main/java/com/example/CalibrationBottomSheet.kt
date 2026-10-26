@@ -1,7 +1,11 @@
 package com.example
 
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -9,6 +13,9 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -22,17 +29,21 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.SwitchDefaults
 import androidx.compose.material3.Text
+import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.CardSurfaceSlate
 import com.example.ui.theme.ElectricIndigo
 import com.example.ui.theme.ElevatedHudSurface
+import com.example.ui.theme.EmeraldReady
 import com.example.ui.theme.SkyCyan
 import com.example.ui.theme.TextIceWhite
 import com.example.ui.theme.TextMutedSlate
@@ -44,10 +55,12 @@ import java.util.Locale
 @Composable
 fun CalibrationBottomSheet(
     calibration: CalibrationConfig,
+    isA11yConnected: Boolean,
     onSensitivityChange: (Float) -> Unit,
     onScrollSpeedChange: (Float) -> Unit,
     onNaturalScrollingChange: (Boolean) -> Unit,
     onTapToClickChange: (Boolean) -> Unit,
+    onOpenDisclosure: () -> Unit,
     onResetDefaults: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -216,7 +229,63 @@ fun CalibrationBottomSheet(
                 )
             }
 
-            Spacer(modifier = Modifier.height(4.dp))
+            // Accessibility API Disclosure & Setup Card
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(CardSurfaceSlate)
+                    .border(1.dp, TrackpadBorderSlate, RoundedCornerShape(10.dp))
+                    .clickable(onClick = onOpenDisclosure)
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .testTag("review_a11y_disclosure_button"),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.calibration_a11y_section_title),
+                        style = MaterialTheme.typography.titleSmall,
+                        color = TextIceWhite
+                    )
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Box(
+                            modifier = Modifier
+                                .size(7.dp)
+                                .clip(CircleShape)
+                                .background(if (isA11yConnected) EmeraldReady else AmberWarning)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            text = stringResource(
+                                if (isA11yConnected) R.string.calibration_a11y_active
+                                else R.string.calibration_a11y_inactive
+                            ),
+                            style = MaterialTheme.typography.labelSmall,
+                            color = if (isA11yConnected) EmeraldReady else AmberWarning
+                        )
+                    }
+                }
+                Box(
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(SkyCyan.copy(alpha = 0.14f))
+                        .border(1.dp, SkyCyan.copy(alpha = 0.6f), RoundedCornerShape(8.dp))
+                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = stringResource(R.string.calibration_a11y_review_btn),
+                        style = MaterialTheme.typography.labelMedium,
+                        color = SkyCyan,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            Spacer(modifier = Modifier.height(2.dp))
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
